@@ -46,7 +46,7 @@ pip install semantic-kernel flask flask-cors
 ### 3. Configurar Chave API
 
 ```bash
-set OPENAI_API_KEY="sua chave aqui"
+set OPENAI_API_KEY="sua_chave_aqui"
 ```
 
 ### 4. Executar Testes
