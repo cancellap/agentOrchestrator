@@ -6,6 +6,9 @@ import os
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,10 +43,21 @@ class ConfigManager:
     def _load_config(self) -> Dict[str, Any]:
         """Carrega configurações do arquivo"""
         if os.path.exists(self.config_file):
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+                    logger.info(f"Configuração carregada com sucesso de {self.config_file}")
+                    return config_data
+            except FileNotFoundError:
+                logger.error(f"Arquivo de configuração {self.config_file} não encontrado. Usando configuração padrão.")
+            except json.JSONDecodeError as e:
+                logger.error(f"Erro ao decodificar JSON do arquivo {self.config_file}: {e}. Usando configuração padrão.")
+            except Exception as e:
+                logger.error(f"Erro inesperado ao carregar {self.config_file}: {e}. Usando configuração padrão.")
+        else:
+            logger.info(f"Arquivo de configuração {self.config_file} não encontrado. Usando configuração padrão.")
         return self._get_default_config()
-    
+
     def _get_default_config(self) -> Dict[str, Any]:
         """Retorna configuração padrão"""
         return {
@@ -73,9 +87,15 @@ class ConfigManager:
     
     def save_config(self):
         """Salva configurações no arquivo"""
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
-    
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            logger.info(f"Configuração salva com sucesso em {self.config_file}")
+        except IOError as e:
+            logger.error(f"Erro de I/O ao salvar configuração em {self.config_file}: {e}")
+        except Exception as e:
+            logger.error(f"Erro inesperado ao salvar configuração em {self.config_file}: {e}")
+
     def get_llm_config(self) -> LLMConfig:
         """Retorna configuração do LLM"""
         llm_config = self.config.get("llm", {})
@@ -131,18 +151,30 @@ class LoggingUtils:
     def setup_logging(config: Dict[str, Any]):
         """Configura logging baseado na configuração"""
         import logging
+        # Removida a importação de logging, pois já está no topo do arquivo.
         
-        level = getattr(logging, config.get("level", "INFO"))
+        log_level_str = config.get("level", "INFO").upper()
+        log_level = getattr(logging, log_level_str, logging.INFO)
         log_file = config.get("file", "orchestrator.log")
-        
+
+        # Remove handlers existentes para evitar duplicação se a função for chamada múltiplas vezes
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
+        handlers = [logging.StreamHandler()]
+        if log_file:
+            try:
+                file_handler = logging.FileHandler(log_file, encoding='utf-8')
+                handlers.append(file_handler)
+            except Exception as e:
+                logging.error(f"Não foi possível criar o handler de arquivo de log {log_file}: {e}. Logando apenas no console.")
+
         logging.basicConfig(
-            level=level,
+            level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
+            handlers=handlers
         )
+        logger.info(f"Logging configurado. Nível: {log_level_str}, Arquivo: {log_file if log_file else 'N/A'}")
 
 
 class MetricsCollector:

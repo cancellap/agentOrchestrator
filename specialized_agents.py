@@ -7,6 +7,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
+from semantic_kernel.exceptions import KernelServiceNotFoundError, KernelFunctionNotFoundError
 from semantic_kernel.prompt_template import InputVariable, PromptTemplateConfig
 from semantic_kernel.functions import KernelArguments
 
@@ -43,11 +44,14 @@ class SemanticKernelAgent(BaseAgent):
             await self._create_chat_function()
             
             logger.info(f"Agente {self.name} inicializado com sucesso")
-            
+
+        except KernelServiceNotFoundError as e:
+            logger.error(f"Erro de serviço do Kernel ao inicializar agente {self.name}: {e}")
+            raise RuntimeError(f"Falha ao configurar o serviço de LLM para o agente {self.name}: {e}") from e
         except Exception as e:
-            logger.error(f"Erro ao inicializar agente {self.name}: {str(e)}")
-            raise
-    
+            logger.error(f"Erro inesperado ao inicializar agente {self.name}: {e}", exc_info=True)
+            raise RuntimeError(f"Erro inesperado durante a inicialização do agente {self.name}: {e}") from e
+
     async def _create_chat_function(self):
         """Cria função de chat personalizada para o agente"""
         prompt_template = f"""
@@ -77,31 +81,57 @@ Resposta:
         )
         
         # Cria a função no kernel
-        self.chat_function = self.kernel.add_function(
-            plugin_name="chat",
-            function_name=f"{self.name}_process",
-            prompt_template_config=prompt_config
-        )
-    
+        try:
+            self.chat_function = self.kernel.add_function(
+                plugin_name=self.name,  # Usar o nome do agente como nome do plugin
+                function_name="process_task",  # Nome de função padronizado
+                prompt_template_config=prompt_config
+            )
+            logger.debug(f"Função de chat '{self.name}/process_task' criada para o agente {self.name}")
+        except Exception as e:
+            logger.error(f"Erro ao criar função de chat para o agente {self.name}: {e}", exc_info=True)
+            raise RuntimeError(f"Não foi possível criar a função de chat para {self.name}: {e}") from e
+
     async def process(self, input_data: str, context: Dict[str, Any] = None) -> str:
         """Processa entrada usando Semantic Kernel"""
+        if not self.kernel or not self.chat_function:
+            logger.error(f"Agente {self.name} não inicializado corretamente. Kernel ou chat_function ausente.")
+            raise RuntimeError(f"Agente {self.name} não está pronto para processar devido à inicialização incompleta.")
+
         try:
             # Prepara argumentos
             arguments = KernelArguments(input=input_data)
             
             if context:
-                # Converte contexto para string se necessário
-                context_str = str(context) if not isinstance(context, str) else context
-                arguments["context"] = context_str
-            
-            # Executa a função
+                try:
+                    # Tenta converter contexto para string, preferencialmente JSON para estruturas
+                    if isinstance(context, (dict, list)):
+                        import json # Import local para evitar dependência global desnecessária
+                        context_str = json.dumps(context, ensure_ascii=False, indent=2)
+                    elif not isinstance(context, str):
+                        context_str = str(context)
+                    else:
+                        context_str = context
+                    arguments["context"] = context_str
+                except TypeError as te:
+                    logger.warning(f"Erro ao serializar contexto para JSON no agente {self.name}: {te}. Usando str(). Contexto: {context}", exc_info=True)
+                    arguments["context"] = str(context) # Fallback
+
+            logger.debug(f"Agente {self.name} invocando função '{self.chat_function.plugin_name}/{self.chat_function.name}' com input: '{input_data[:50]}...'")
             result = await self.kernel.invoke(self.chat_function, arguments)
             
-            return str(result)
+            response_str = str(result)
+            logger.info(f"Agente {self.name} processou a tarefa com sucesso.")
+            logger.debug(f"Resposta do agente {self.name} (início): {response_str[:200]}...")
+            return response_str
             
+        except KernelFunctionNotFoundError as e:
+            logger.error(f"Função de chat '{self.chat_function.plugin_name}/{self.chat_function.name}' não encontrada no agente {self.name} durante o processamento: {e}", exc_info=True)
+            raise RuntimeError(f"Erro de execução no agente {self.name}: função de chat não encontrada ou mal configurada.") from e
         except Exception as e:
-            logger.error(f"Erro ao processar entrada no agente {self.name}: {str(e)}")
-            return f"Erro: {str(e)}"
+            # Captura outras exceções que podem ocorrer durante a invocação do Kernel
+            logger.error(f"Erro inesperado ao processar entrada no agente {self.name} para input '{input_data[:50]}...': {e}", exc_info=True)
+            raise RuntimeError(f"Falha no processamento do agente {self.name} devido a um erro inesperado: {e}") from e
 
 
 class AnalystAgent(SemanticKernelAgent):

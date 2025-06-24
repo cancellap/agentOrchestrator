@@ -3,46 +3,78 @@ Interface Web para o Sistema de Orquestração de Agentes
 Aplicação Flask para interação com o sistema
 """
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, make_response
 from flask_cors import CORS
 import asyncio
 import logging
 import os
 from datetime import datetime
-import json
+import json # Embora json seja usado implicitamente por jsonify, pode ser útil para carregar/validar.
 
 from orchestration_system import OrchestrationSystem, OrchestrationWorkflow
+# Importar ConfigManager para obter configurações de logging, se necessário para configurar antes do app.
+from config_utils import ConfigManager, LoggingUtils
 
-# Configuração de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configuração de logging inicial (pode ser sobrescrita pela config do OrchestrationSystem)
+# É importante configurar o logging o mais cedo possível.
+# Se OrchestrationSystem configura o logging, esta configuração pode ser redundante ou um fallback.
+# Vamos assumir que OrchestrationSystem.initialize() irá configurar o logging principal.
+logger = logging.getLogger(__name__) # Logger específico para a interface web
+
 
 # Cria aplicação Flask
 app = Flask(__name__)
 CORS(app)  # Permite CORS para todas as rotas
 
-# Sistema de orquestração global
-orchestration_system = None
-workflow_manager = None
+# Sistema de orquestração global - será inicializado em initialize_system
+orchestration_system: Optional[OrchestrationSystem] = None
+workflow_manager: Optional[OrchestrationWorkflow] = None
+system_initialized_successfully = False
 
 
-async def initialize_system():
-    """Inicializa o sistema de orquestração"""
-    global orchestration_system, workflow_manager
+async def initialize_system_globally():
+    """Inicializa o sistema de orquestração globalmente."""
+    global orchestration_system, workflow_manager, system_initialized_successfully
     
-    try:
-        orchestration_system = OrchestrationSystem()
-        await orchestration_system.initialize()
-        
-        workflow_manager = OrchestrationWorkflow(orchestration_system)
-        
-        logger.info("Sistema de orquestração inicializado com sucesso")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Erro ao inicializar sistema: {str(e)}")
-        return False
+    if orchestration_system is not None:
+        logger.info("Sistema de orquestração já inicializado.")
+        return
 
+    try:
+        # Primeiro, configurar o logging usando ConfigManager, se o OrchestrationSystem não o fizer primeiro.
+        # Se OrchestrationSystem já configura, esta parte pode ser ajustada.
+        # temp_config_manager = ConfigManager()
+        # LoggingUtils.setup_logging(temp_config_manager.config.get("logging", {}))
+        # logger.info("Logging configurado para a interface web (tentativa inicial).")
+
+        logger.info("Iniciando a inicialização do sistema de orquestração...")
+        temp_system = OrchestrationSystem() # OrchestrationSystem agora configura o logging.
+        await temp_system.initialize() # Pode levantar RuntimeError
+        
+        orchestration_system = temp_system
+        workflow_manager = OrchestrationWorkflow(orchestration_system)
+        system_initialized_successfully = True
+        logger.info("Sistema de orquestração e workflow manager inicializados com sucesso globalmente.")
+        
+    except RuntimeError as rte:
+        logger.critical(f"Falha crítica ao inicializar o sistema de orquestração global: {rte}", exc_info=True)
+        system_initialized_successfully = False
+        # A aplicação pode continuar rodando, mas os endpoints que dependem do sistema falharão.
+    except Exception as e:
+        logger.critical(f"Erro inesperado e crítico durante a inicialização global do sistema: {e}", exc_info=True)
+        system_initialized_successfully = False
+
+# Decorador para verificar se o sistema foi inicializado
+from functools import wraps
+
+def require_system_initialized(f):
+    @wraps(f)
+    async def decorated_function(*args, **kwargs):
+        if not system_initialized_successfully or orchestration_system is None:
+            logger.error(f"Endpoint {request.path} chamado, mas o sistema não foi inicializado corretamente.")
+            return jsonify({"success": False, "error": "O sistema de orquestração não está disponível ou falhou ao inicializar."}), 503 # Service Unavailable
+        return await f(*args, **kwargs)
+    return decorated_function
 
 # Template HTML para interface web
 HTML_TEMPLATE = """
@@ -374,173 +406,290 @@ def index():
 
 
 @app.route('/api/status')
-def get_status():
+@require_system_initialized
+async def get_status():
     """Retorna status do sistema"""
-    if orchestration_system is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
-    
+    # O orchestration_system é garantido pelo decorador
     try:
         status = orchestration_system.get_system_status()
-        return jsonify(status)
+        return jsonify(status), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Erro ao obter status do sistema: {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"Erro interno ao processar status: {e}"}), 500
 
 
 @app.route('/api/agents')
-def get_agents():
+@require_system_initialized
+async def get_agents():
     """Retorna agentes disponíveis"""
-    if orchestration_system is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
-    
     try:
         agents = orchestration_system.get_available_agents()
-        return jsonify({"agents": agents})
+        return jsonify({"agents": agents}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Erro ao obter lista de agentes: {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"Erro interno ao buscar agentes: {e}"}), 500
 
 
 @app.route('/api/orchestrators', methods=['GET', 'POST'])
-def handle_orchestrators():
+@require_system_initialized
+async def handle_orchestrators():
     """Gerencia orquestradores"""
-    if orchestration_system is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
-    
     if request.method == 'GET':
         try:
             orchestrators = orchestration_system.get_orchestrators()
-            return jsonify({"orchestrators": orchestrators})
+            return jsonify({"orchestrators": orchestrators}), 200
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            logger.error(f"Erro ao listar orquestradores: {e}", exc_info=True)
+            return jsonify({"success": False, "error": f"Erro interno ao listar orquestradores: {e}"}), 500
     
     elif request.method == 'POST':
+        if not request.is_json:
+            logger.warning("Tentativa de criar orquestrador sem JSON.")
+            return jsonify({"success": False, "error": "Requisição deve ser JSON."}), 400
+
+        data = request.get_json()
+        required_fields = ['name', 'pattern', 'agent_names']
+        missing_fields = [field for field in required_fields if field not in data or not data[field]]
+
+        if missing_fields:
+            logger.warning(f"Tentativa de criar orquestrador com campos ausentes: {missing_fields}")
+            return jsonify({"success": False, "error": f"Campos obrigatórios ausentes: {', '.join(missing_fields)}"}), 400
+
+        if not isinstance(data['agent_names'], list) or not data['agent_names']:
+             logger.warning(f"Tentativa de criar orquestrador '{data['name']}' com lista de agentes inválida.")
+             return jsonify({"success": False, "error": "O campo 'agent_names' deve ser uma lista não vazia de nomes de agentes."}), 400
+
         try:
-            data = request.get_json()
+            # Não é necessário criar um novo loop de eventos aqui se o Flask estiver rodando com um executor async (como uvicorn/hypercorn)
+            # ou se estivermos usando `await` diretamente em rotas async.
+            # Se Flask estiver rodando em modo síncrono tradicional, precisaremos de `asyncio.run_coroutine_threadsafe` ou similar.
+            # Para simplicidade com `app.run(debug=True)`, vamos assumir que o loop padrão do asyncio pode ser usado.
+            # Em produção, um servidor ASGI como Uvicorn é recomendado para Flask async.
+            # loop = asyncio.get_event_loop() # Obter loop existente
             
-            # Valida dados
-            required_fields = ['name', 'pattern', 'agent_names']
-            for field in required_fields:
-                if field not in data:
-                    return jsonify({"error": f"Campo obrigatório: {field}"}), 400
-            
-            # Cria orquestrador
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            orchestrator_name = loop.run_until_complete(
-                orchestration_system.create_orchestrator(
-                    name=data['name'],
-                    pattern=data['pattern'],
-                    agent_names=data['agent_names'],
-                    max_iterations=data.get('max_iterations', 10),
-                    timeout=data.get('timeout', 300)
-                )
+            orchestrator_name = await orchestration_system.create_orchestrator(
+                name=str(data['name']),
+                pattern=str(data['pattern']),
+                agent_names=[str(an) for an in data['agent_names']], # Garante que são strings
+                max_iterations=data.get('max_iterations'), # Passa None se não existir, OrchestrationSystem usará default
+                timeout=data.get('timeout') # Passa None se não existir
             )
             
             return jsonify({
                 "success": True,
                 "orchestrator_name": orchestrator_name,
-                "message": f"Orquestrador '{orchestrator_name}' criado com sucesso"
-            })
-            
-        except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
+                "message": f"Orquestrador '{orchestrator_name}' criado com sucesso."
+            }), 201 # Created
+        except ValueError as ve: # Erros de validação de dados do OrchestrationSystem
+            logger.warning(f"Erro de valor ao criar orquestrador '{data.get('name')}': {ve}")
+            return jsonify({"success": False, "error": str(ve)}), 400
+        except RuntimeError as rte: # Erros de runtime (e.g., falha ao registrar agente)
+            logger.error(f"Erro de runtime ao criar orquestrador '{data.get('name')}': {rte}", exc_info=True)
+            return jsonify({"success": False, "error": str(rte)}), 500
+        except Exception as e: # Outros erros inesperados
+            logger.critical(f"Erro inesperado e não tratado ao criar orquestrador '{data.get('name')}': {e}", exc_info=True)
+            return jsonify({"success": False, "error": f"Erro interno no servidor ao criar orquestrador: {e}"}), 500
 
 
 @app.route('/api/execute', methods=['POST'])
-def execute_orchestration():
+@require_system_initialized
+async def execute_orchestration_endpoint(): # Renomeado para evitar conflito com a função importada
     """Executa uma orquestração"""
-    if orchestration_system is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Requisição deve ser JSON."}), 400
+
+    data = request.get_json()
+    orchestrator_name = data.get('orchestrator_name')
+    task = data.get('task')
+
+    if not orchestrator_name or not task:
+        missing = []
+        if not orchestrator_name: missing.append('orchestrator_name')
+        if not task: missing.append('task')
+        return jsonify({"success": False, "error": f"Campos obrigatórios ausentes: {', '.join(missing)}"}), 400
+
+    context_input = data.get('context')
+    parsed_context = None
+    if isinstance(context_input, str) and context_input.strip():
+        try:
+            parsed_context = json.loads(context_input)
+        except json.JSONDecodeError as je:
+            logger.warning(f"Contexto fornecido para orquestrador '{orchestrator_name}' não é JSON válido: {context_input[:100]}... Erro: {je}")
+            return jsonify({"success": False, "error": f"Contexto fornecido não é um JSON válido: {je}"}), 400
+    elif isinstance(context_input, dict):
+        parsed_context = context_input
     
     try:
-        data = request.get_json()
-        
-        # Valida dados
-        required_fields = ['orchestrator_name', 'task']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({"error": f"Campo obrigatório: {field}"}), 400
-        
-        # Executa orquestração
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        result = loop.run_until_complete(
-            orchestration_system.execute_orchestration(
-                orchestrator_name=data['orchestrator_name'],
-                task=data['task'],
-                context=data.get('context')
-            )
+        # orchestration_system.execute_orchestration já retorna um dict
+        result = await orchestration_system.execute_orchestration(
+            orchestrator_name=str(orchestrator_name),
+            task=str(task),
+            context=parsed_context
         )
         
-        return jsonify(result)
+        # O resultado já contém 'success' e 'error' se aplicável
+        status_code = 200 if result.get("success") else 400 # Ou 500 se for erro interno
+        if not result.get("success") and "não encontrado" in result.get("error", "").lower():
+            status_code = 404 # Not Found
+        elif not result.get("success") and "crítico" in result.get("error", "").lower():
+             status_code = 500 # Internal Server Error
+
+        return jsonify(result), status_code
         
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as e: # Captura de segurança para erros não esperados na camada da API
+        logger.critical(f"Erro crítico e inesperado na API /execute para '{orchestrator_name}': {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"Erro interno crítico no servidor ao executar orquestração: {e}"}), 500
 
 
 @app.route('/api/metrics')
-def get_metrics():
+@require_system_initialized
+async def get_metrics():
     """Retorna métricas do sistema"""
-    if orchestration_system is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
-    
     try:
         metrics = orchestration_system.get_metrics()
-        return jsonify({"metrics": metrics})
+        return jsonify({"metrics": metrics}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Erro ao obter métricas: {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"Erro interno ao buscar métricas: {e}"}), 500
 
 
 @app.route('/api/workflows', methods=['GET', 'POST'])
-def handle_workflows():
+@require_system_initialized
+async def handle_workflows_endpoint(): # Renomeado
     """Gerencia workflows"""
-    if workflow_manager is None:
-        return jsonify({"error": "Sistema não inicializado"}), 500
-    
+    # workflow_manager é garantido pelo decorador (se orchestration_system estiver ok)
+    if workflow_manager is None: # Checagem extra, embora o decorador deva cobrir
+         logger.error("Workflow manager não está disponível, embora o sistema pareça inicializado.")
+         return jsonify({"success": False, "error": "Gerenciador de workflows não está disponível."}), 503
+
     if request.method == 'GET':
         try:
             workflows = workflow_manager.get_workflows()
-            return jsonify({"workflows": workflows})
+            return jsonify({"workflows": workflows}), 200
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            logger.error(f"Erro ao listar workflows: {e}", exc_info=True)
+            return jsonify({"success": False, "error": f"Erro interno ao listar workflows: {e}"}), 500
     
     elif request.method == 'POST':
+        if not request.is_json:
+            return jsonify({"success": False, "error": "Requisição deve ser JSON."}), 400
+            
+        data = request.get_json()
+        required_fields = ['name', 'steps']
+        missing_fields = [field for field in required_fields if field not in data or not data[field]]
+
+        if missing_fields:
+            return jsonify({"success": False, "error": f"Campos obrigatórios ausentes para definir workflow: {', '.join(missing_fields)}"}), 400
+
+        if not isinstance(data['steps'], list) or not data['steps']:
+             return jsonify({"success": False, "error": "O campo 'steps' deve ser uma lista não vazia de etapas do workflow."}), 400
+
         try:
-            data = request.get_json()
-            
             workflow_manager.define_workflow(
-                name=data['name'],
-                steps=data['steps'],
-                description=data.get('description', '')
+                name=str(data['name']),
+                steps=data['steps'], # Validação mais profunda dos steps é feita em define_workflow
+                description=str(data.get('description', ''))
             )
-            
             return jsonify({
                 "success": True,
-                "message": f"Workflow '{data['name']}' definido com sucesso"
-            })
-            
+                "message": f"Workflow '{data['name']}' definido com sucesso."
+            }), 201
+        except ValueError as ve:
+            logger.warning(f"Erro de valor ao definir workflow '{data.get('name')}': {ve}")
+            return jsonify({"success": False, "error": str(ve)}), 400
         except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
+            logger.error(f"Erro inesperado ao definir workflow '{data.get('name')}': {e}", exc_info=True)
+            return jsonify({"success": False, "error": f"Erro interno ao definir workflow: {e}"}), 500
+
+# Adicionar um endpoint para executar workflows
+@app.route('/api/workflows/execute', methods=['POST'])
+@require_system_initialized
+async def execute_workflow_endpoint():
+    if workflow_manager is None:
+         logger.error("Workflow manager não está disponível.")
+         return jsonify({"success": False, "error": "Gerenciador de workflows não está disponível."}), 503
+    
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Requisição deve ser JSON."}), 400
+    
+    data = request.get_json()
+    workflow_name = data.get('workflow_name')
+    initial_input = data.get('initial_input')
+
+    if not workflow_name or not initial_input:
+        missing = []
+        if not workflow_name: missing.append('workflow_name')
+        if not initial_input: missing.append('initial_input')
+        return jsonify({"success": False, "error": f"Campos obrigatórios ausentes para executar workflow: {', '.join(missing)}"}), 400
+
+    parsed_context = None
+    context_input = data.get('context')
+    if isinstance(context_input, str) and context_input.strip():
+        try:
+            parsed_context = json.loads(context_input)
+        except json.JSONDecodeError as je:
+            return jsonify({"success": False, "error": f"Contexto fornecido não é um JSON válido: {je}"}), 400
+    elif isinstance(context_input, dict):
+        parsed_context = context_input
+
+    try:
+        result = await workflow_manager.execute_workflow(
+            workflow_name=str(workflow_name),
+            initial_input=str(initial_input),
+            context=parsed_context
+        )
+        status_code = 200 if result.get("success") else 400
+        if not result.get("success") and "não encontrado" in result.get("error", "").lower():
+            status_code = 404
+        elif not result.get("success") and "crítico" in result.get("error", "").lower():
+            status_code = 500
+
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.critical(f"Erro crítico e inesperado na API /workflows/execute para '{workflow_name}': {e}", exc_info=True)
+        return jsonify({"success": False, "error": f"Erro interno crítico no servidor ao executar workflow: {e}"}), 500
 
 
-def run_app():
-    """Executa a aplicação"""
-    # Inicializa sistema
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def run_app(run_init_system=True): # Parâmetro para controlar a inicialização durante testes, por exemplo
+    """Executa a aplicação Flask."""
     
-    success = loop.run_until_complete(initialize_system())
-    
-    if not success:
-        print("Erro ao inicializar sistema. Verifique as configurações.")
-        return
-    
+    if run_init_system:
+        # Inicializa o sistema de orquestração em um loop de eventos asyncio
+        # Isso é crucial se o Flask estiver rodando em um ambiente que não gerencia o loop por padrão para tarefas de inicialização.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed(): # Se o loop foi fechado por algum motivo (raro no início)
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                loop = asyncio.get_event_loop()
+
+            logger.info("Tentando inicializar o sistema de orquestração antes de rodar o app Flask...")
+            loop.run_until_complete(initialize_system_globally()) # Renomeado
+
+            if not system_initialized_successfully:
+                logger.critical("O sistema de orquestração falhou ao inicializar. A aplicação pode não funcionar corretamente.")
+                # Decide se deve parar a aplicação ou continuar com funcionalidade limitada.
+                # Por agora, apenas loga e continua.
+            else:
+                logger.info("Sistema de orquestração parece ter sido inicializado com sucesso.")
+
+        except Exception as e:
+            logger.critical(f"Exceção não tratada durante a tentativa de inicialização do sistema antes de rodar o app: {e}", exc_info=True)
+            # Considerar se deve impedir o app de rodar.
+
     # Executa aplicação Flask
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
-
+    # Para produção, use um servidor WSGI/ASGI como Gunicorn/Uvicorn.
+    # app.run() é principalmente para desenvolvimento.
+    try:
+        port = int(os.environ.get('PORT', 5000))
+        # `debug=False` é mais seguro para qualquer ambiente que não seja estritamente desenvolvimento local.
+        # O modo debug do Flask pode ter implicações de segurança e performance.
+        # Além disso, o reloader do modo debug pode causar problemas com inicialização de asyncio.
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except Exception as e:
+        logger.critical(f"Falha ao iniciar a aplicação Flask: {e}", exc_info=True)
 
 if __name__ == '__main__':
+    # Este bloco é executado quando o script é rodado diretamente.
+    # É um bom lugar para inicializar tarefas que precisam acontecer uma vez no início.
     run_app()
 
