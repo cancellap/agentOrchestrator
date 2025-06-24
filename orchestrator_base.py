@@ -127,11 +127,15 @@ class AgentOrchestrator:
             return {
                 "success": False,
                 "error": f"Erro de configuração da orquestração: {ve}",
+                "pattern": self.pattern.value
+            }
         except RuntimeError as rte: # Erros originados nos agentes ou lógicas internas
             logger.error(f"Erro de execução durante a orquestração: {rte}", exc_info=True)
             return {
                 "success": False,
                 "error": f"Erro durante a execução da orquestração: {rte}",
+                "pattern": self.pattern.value
+            }
         except Exception as e: # Captura genérica para erros inesperados
             logger.error(f"Erro inesperado e não tratado durante a orquestração: {e}", exc_info=True)
             return {
@@ -448,4 +452,3 @@ if __name__ == "__main__":
     print("- BaseAgent: Classe base para agentes")
     print("- OrchestrationPattern: Padrões de orquestração")
     print("- AgentConfig: Configuração de agentes")
-
